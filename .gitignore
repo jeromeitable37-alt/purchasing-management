@@ -1,0 +1,10 @@
+node_modules/
+.next/
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.p12
+firebase-service-account.json
+service-account.json

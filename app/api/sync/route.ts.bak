@@ -1,0 +1,252 @@
+import crypto from "node:crypto";
+import { NextResponse } from "next/server";
+import { adminDb } from "@/lib/admin";
+import { getSpreadsheetTabs, readTab, upsertTabRows } from "@/lib/googleSheets";
+
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+
+const SUPPLIER_SHEET_ID = process.env.SUPPLIER_SHEET_ID || "1XjBq3f-zM8QUkgLPlDccbz9c1Jy8L0JTJUOrZ0skfHA";
+const SUPPLIER_EVAL_TAB = process.env.SUPPLIER_PO_SHEET || "PO for Evaluation";
+const SUPPLIER_PRF_TAB = process.env.SUPPLIER_PRF_SHEET || "PRF Details v2";
+const ROUTING_SHEET_ID = process.env.ROUTING_SHEET_ID || "1h4OvmGWLzhUf2A9xk8uOmeVQgrKV1Xug42n9LH77Avw";
+const ROUTING_SHEET_TABS = (process.env.ROUTING_SHEET_TABS || process.env.ROUTING_SHEET_NAME || "PRF - SISC,SRF - SISC").split(",").map(s => s.trim()).filter(Boolean);
+
+const nowIso = () => new Date().toISOString();
+function lowerKey(value: unknown) { return String(value ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, ""); }
+function pick(row: Record<string, string>, names: string[]) {
+  const entries = Object.entries(row);
+  for (const name of names) {
+    const target = lowerKey(name);
+    const found = entries.find(([key]) => lowerKey(key) === target);
+    if (found && String(found[1] ?? "").trim() !== "") return String(found[1]).trim();
+  }
+  return "";
+}
+function rowHash(row: Record<string, string>) {
+  const normalized = Object.keys(row).filter(k => !k.startsWith("__")).sort().reduce<Record<string,string>>((acc, k) => { acc[k] = String(row[k] ?? ""); return acc; }, {});
+  return crypto.createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+}
+function stableId(prefix: string, value: string) { return `${prefix}-${crypto.createHash("sha1").update(value.trim().toLowerCase()).digest("hex").slice(0, 28)}`; }
+function num(value: string) { const n = Number(String(value ?? "").replace(/,/g, "")); return Number.isFinite(n) ? n : 0; }
+function isoOrBlank(value: string) { if (!value) return ""; const d = new Date(value); return Number.isNaN(d.getTime()) ? value : d.toISOString(); }
+function completedEvalStatus(row: Record<string,string>, current: any) {
+  const raw = pick(row, ["Status", "Evaluation Status", "EvaluationStatus"]).toLowerCase();
+  const score = num(pick(row, ["Overall Score", "OverallScore", "Average Score", "FINAL RATING"]));
+  const submittedAt = pick(row, ["Submitted At", "Date Evaluated", "Evaluated At", "Evaluation Date"]);
+  const currentDone = ["submitted","completed","evaluated","done","complete"].includes(String(current?.status || "").toLowerCase()) || !!current?.submittedAt || num(String(current?.overallScore || "")) > 0;
+  if (currentDone || ["submitted","completed","evaluated","done","complete"].includes(raw) || submittedAt || score > 0) return "submitted";
+  if (["opened","viewed"].includes(raw)) return "opened";
+  if (["sent","emailed","email sent"].includes(raw)) return "sent";
+  if (["overdue","past due"].includes(raw)) return "overdue";
+  return current?.status || "pending";
+}
+
+function routeHistoryFromRow(row: Record<string,string>) {
+  const existing = pick(row, ["History JSON", "Route History", "History"]);
+  if (existing) { try { const parsed = JSON.parse(existing); if (Array.isArray(parsed)) return parsed; } catch {} }
+  const events: any[] = [];
+  const add = (label: string, value: string, extra: Record<string,any> = {}) => { if (!value) return; events.push({ timestamp: isoOrBlank(value) || value, action: label, ...extra }); };
+  add("PRF received by AMD", pick(row, ["DATE RECEIVED BY AMD", "Date Received by AMD"]));
+  add("PRF encoded / date received", pick(row, ["Date Received"]));
+  add("Canvassing started", pick(row, ["DATE START PROCESSING/ CANVASSING"]));
+  add("Canvassing completed", pick(row, ["DATE END CANVASSED"]));
+  add("Fully approved PRF received", pick(row, ["DATE RECEIVED OF FULLY APPROVED PRF"]));
+  add("PO created", pick(row, ["DATE OF PO"]), { status: pick(row, ["STATUS IN PURCHASING"]) || "PO Created" });
+  add("PO forwarded to AMD / Accounting", pick(row, ["DATE OF PO FORWARDED TO AMD AND ACCTNG"]));
+  add("Delivery date", pick(row, ["Delivery Date"]));
+  add("Actual delivery", pick(row, ["ACTUAL DELIVERY DATE"]), { status: pick(row, ["STATUS IN PURCHASING"]) || "Delivered", currentHolder: pick(row, ["DELIVERY RECEIVED BY"]) });
+  add("Forwarded to Accounting", pick(row, ["DATE forwarded to Accounting"]));
+  add("Received by requisitioner", pick(row, ["DATE RECEIVED BY REQUISITIONER"]));
+  return events.sort((a,b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+}
+
+function routeFromRow(row: Record<string,string>, tab: string) {
+  const prfNo = pick(row, ["PRF NO.", "PRF No", "PRF"]);
+  const poNumber = pick(row, ["PO NUMBER", "PO Number", "PO No.", "PO"]);
+  const referenceNo = prfNo || poNumber;
+  if (!referenceNo) return null;
+  const trackingId = `RT-${(poNumber || prfNo).replace(/\s+/g, "-")}`;
+  const status = pick(row, ["STATUS IN PURCHASING", "PRF Status", "Status"]) || (pick(row, ["ACTUAL DELIVERY DATE"]) ? "Completed" : "For Routing");
+  const actualDelivery = pick(row, ["ACTUAL DELIVERY DATE"]);
+  const currentHolder = actualDelivery ? pick(row, ["DELIVERY RECEIVED BY"]) : pick(row, ["Purchaser Assigned", "PURCHASER ASSIGNED"]) || "Purchasing";
+  const sourceKey = `${tab}|${prfNo || poNumber}`;
+  return {
+    id: stableId("route", sourceKey),
+    trackingId,
+    documentType: tab.toUpperCase().startsWith("SRF") ? "SRF" : "PRF",
+    referenceNo,
+    prfNo,
+    poNumber,
+    documentTitle: pick(row, ["ITEM DESCRIPTION", "Item Description"]),
+    requester: pick(row, ["REQUISITIONER", "Requester"]),
+    department: pick(row, ["DEPARTMENT", "Department"]),
+    from: "Purchasing",
+    to: actualDelivery ? "Requisitioner" : "Purchasing",
+    currentHolder,
+    status,
+    dateRouted: pick(row, ["DATE RECEIVED BY AMD", "Date Received by AMD", "DATE OF PO"]),
+    dateReceived: pick(row, ["DATE RECEIVED OF FULLY APPROVED PRF", "Date Received"]),
+    receivedBy: pick(row, ["DELIVERY RECEIVED BY"]),
+    dateReturned: "",
+    remarks: pick(row, ["REMARKS", "AMD REMARKS", "N", "AC", "Remarks"]),
+    history: routeHistoryFromRow(row),
+    source: `V2 workbook · ${tab}`,
+    sourceSheet: tab,
+    sourceRow: Number(row.__rowNumber || 0),
+  };
+}
+
+async function writeBatch<T>(collection: string, writes: Array<{ id: string; data: T }>) {
+  for (let i = 0; i < writes.length; i += 400) {
+    const batch = adminDb.batch();
+    for (const item of writes.slice(i, i + 400)) batch.set(adminDb.collection(collection).doc(item.id), item.data as any, { merge: true });
+    await batch.commit();
+  }
+}
+
+async function importEvaluations() {
+  const tab = await readTab(SUPPLIER_SHEET_ID, SUPPLIER_EVAL_TAB);
+  const writes: Array<{id:string;data:any}> = [];
+  let changed = 0, skipped = 0;
+  for (const row of tab.rows) {
+    const poNumber = pick(row, ["PO Number", "PO No.", "P.O.", "PO"]);
+    const email = pick(row, ["Evaluator Email", "Email", "Requisitioner Email"]);
+    const vendorName = pick(row, ["Vendor", "Vendor Name", "Supplier", "Supplier Name", "Company Name"]);
+    const systemId = pick(row, ["_systemId", "System ID", "Evaluation ID", "EvaluationID"]);
+    if (!poNumber && !systemId && !vendorName) continue;
+    const id = systemId || stableId("sheet-eval", `${poNumber}|${email}|${vendorName}`);
+    const sourceHash = rowHash(row);
+    const ref = adminDb.collection("evaluations").doc(id);
+    const existing = await ref.get();
+    const current = existing.exists ? existing.data() : {};
+    if (current?.sourceHash === sourceHash && current?.sourceSheet === tab.tab) { skipped++; continue; }
+    const updatedAt = isoOrBlank(pick(row, ["updatedAt", "Updated At", "Last Updated"])) || nowIso();
+    writes.push({ id, data: {
+      id, token: current?.token || crypto.randomBytes(24).toString("hex"), poNumber,
+      prfNo: pick(row, ["PRF No.", "PRF No", "PRF"]), vendorName, supplier: vendorName,
+      evaluatorName: pick(row, ["Evaluator Name", "Name", "Requisitioner"]), evaluatorEmail: email,
+      evaluatorRole: pick(row, ["Evaluator Role", "Role"]) || current?.evaluatorRole || "requisitioner",
+      status: completedEvalStatus(row, current), deliveryDate: pick(row, ["Delivery Date"]), expectedDeliveryDate: pick(row, ["Expected Delivery Date"]), actualDeliveryDate: pick(row, ["Actual Delivery Date"]),
+      totalAmount: num(pick(row, ["Total Amount", "PO Total", "Total"])) || Number(current?.totalAmount || 0), itemsDelivered: pick(row, ["Items Delivered", "Items"]),
+      accurateDelivery: num(pick(row, ["Accurate Delivery / Quality", "Accurate Delivery", "AccurateDelivery"])) || Number(current?.accurateDelivery || 0), competitivePrice: num(pick(row, ["Competitive Price", "CompetitivePrice"])) || Number(current?.competitivePrice || 0), timeliness: num(pick(row, ["Timeliness of Delivery", "Timeliness"])) || Number(current?.timeliness || 0), afterSales: num(pick(row, ["After Sales Services", "After Sales", "AfterSales"])) || Number(current?.afterSales || 0), compliance: num(pick(row, ["Compliance with Regulatory Requirements and School Policies", "Compliance"])) || Number(current?.compliance || 0),
+      comments: pick(row, ["Comments", "Remarks"]), overallScore: num(pick(row, ["Overall Score", "OverallScore", "Average Score"])) || Number(current?.overallScore || 0),
+      sentAt: isoOrBlank(pick(row, ["Sent At"])), submittedAt: isoOrBlank(pick(row, ["Submitted At", "Date Evaluated", "Evaluated At", "Evaluation Date"])),
+      updatedAt, source: "supplier evaluation spreadsheet", sourceSheet: tab.tab, sourceRow: Number(row.__rowNumber || 0), sourceHash, lastExportAt: nowIso(),
+    }}); changed++;
+  }
+  await writeBatch("evaluations", writes);
+  return { changed, skipped, total: tab.rows.length };
+}
+
+async function importPRFDetails() {
+  const tab = await readTab(SUPPLIER_SHEET_ID, SUPPLIER_PRF_TAB);
+  const writes: Array<{id:string;data:any}> = [];
+  let changed = 0, skipped = 0;
+  for (const row of tab.rows) {
+    const key = pick(row, ["_systemId", "System ID", "PRF No.", "PRF No", "PRF", "Reference No.", "Reference No", "PO Number", "PO No."]);
+    if (!key) continue;
+    const id = stableId("prf", key);
+    const sourceHash = rowHash(row);
+    const ref = adminDb.collection("prfDetails").doc(id);
+    const existing = await ref.get();
+    const current = existing.exists ? existing.data() : {};
+    if (current?.sourceHash === sourceHash && current?.sourceSheet === tab.tab) { skipped++; continue; }
+    writes.push({ id, data: { id, ...row, source: "PRF Details v2 spreadsheet", sourceSheet: tab.tab, sourceRow: Number(row.__rowNumber || 0), sourceHash, lastExportAt: nowIso(), updatedAt: nowIso() } });
+    changed++;
+  }
+  await writeBatch("prfDetails", writes);
+  return { changed, skipped, total: tab.rows.length };
+}
+
+async function importRoutes() {
+  const all: Array<{id:string;data:any}> = [];
+  let changed = 0, skipped = 0, total = 0;
+  const tabs = await getSpreadsheetTabs(ROUTING_SHEET_ID);
+  const candidates = Array.from(new Set([
+    ...ROUTING_SHEET_TABS,
+    ...tabs.map(t=>t.properties.title).filter(t=>/PRF|SRF|ROUTE|TRACK|MONITOR/i.test(t)).slice(0,8)
+  ]));
+  for (const preferred of candidates) {
+    let tab: Awaited<ReturnType<typeof readTab>>;
+    try { tab = await readTab(ROUTING_SHEET_ID, preferred); } catch { continue; }
+    const hasRoutingHeaders = tab.headers.some(h=>/PRF|PO|REQUISITIONER|STATUS|DELIVERY|ROUT|TRACK/i.test(h));
+    if (!hasRoutingHeaders) continue;
+    total += tab.rows.length;
+    for (const row of tab.rows) {
+      const mapped = routeFromRow(row, tab.tab);
+      if (!mapped) continue;
+      const sourceHash = rowHash(row);
+      const ref = adminDb.collection("routes").doc(mapped.id);
+      const existing = await ref.get();
+      const current = existing.exists ? existing.data() : {};
+      if (current?.sourceHash === sourceHash && current?.sourceSheet === tab.tab) { skipped++; continue; }
+      const history = (mapped.history?.length ? mapped.history : (current?.history || []));
+      all.push({ id: mapped.id, data: { ...current, ...mapped, history, sourceHash, lastSyncedAt: nowIso(), lastExportAt: nowIso(), updatedAt: nowIso() } });
+      changed++;
+    }
+  }
+  await writeBatch("routes", all);
+  return { changed, skipped, total };
+}
+
+async function exportDirty(collection: string, mapper: (data:any, id:string)=>Record<string,unknown>, sheetId: string, tabName: string) {
+  const snap = await adminDb.collection(collection).get();
+  const dirty = snap.docs.filter(d => {
+    const data = d.data() as any;
+    if (!data.lastExportAt) return true;
+    if (!data.updatedAt) return true;
+    return new Date(String(data.updatedAt)).getTime() > new Date(String(data.lastExportAt)).getTime() + 500;
+  });
+  if (!dirty.length) return { updated: 0, appended: 0, skipped: snap.size };
+  const rows = dirty.map(d => mapper(d.data(), d.id));
+  const result = await upsertTabRows(sheetId, tabName, rows);
+  const stamp = nowIso();
+  await writeBatch(collection, dirty.map(d => ({ id: d.id, data: { lastExportAt: stamp } })));
+  return { ...result, skipped: snap.size - dirty.length };
+}
+
+async function resolveRoutingTab() {
+  try { const tabs = await getSpreadsheetTabs(ROUTING_SHEET_ID); for (const preferred of ROUTING_SHEET_TABS) if (tabs.some(t => t.properties.title === preferred)) return preferred; return tabs[0]?.properties.title || ""; } catch { return ROUTING_SHEET_TABS[0] || ""; }
+}
+
+export async function GET() {
+  let stage = "starting";
+  try {
+    stage = "import-evaluations";
+    const evaluations = await importEvaluations();
+    stage = "import-prf";
+    const prf = await importPRFDetails();
+    stage = "import-routing";
+    const routes = await importRoutes();
+
+    stage = "export-evaluations";
+    const evalExport = await exportDirty("evaluations", (d,id)=>({ _systemId:id, ...d, "System ID":id, "Evaluation ID":id }), SUPPLIER_SHEET_ID, SUPPLIER_EVAL_TAB);
+    stage = "export-prf";
+    const prfExport = await exportDirty("prfDetails", (d,id)=>({ _systemId:id, ...d, "System ID":id }), SUPPLIER_SHEET_ID, SUPPLIER_PRF_TAB);
+    stage = "export-routing";
+    const routeTab = await resolveRoutingTab();
+    const routeExport = await exportDirty("routes", (d,id)=>({ _systemId:id, "Tracking ID":d.trackingId || id, ...d, "History JSON":JSON.stringify(d.history || []), "System ID":id }), ROUTING_SHEET_ID, routeTab);
+
+    const result = {
+      ok: true,
+      mode: "delta-reconciliation",
+      evaluationRecordsImported: evaluations.changed,
+      evaluationRecordsSkipped: evaluations.skipped,
+      prfRecordsImported: prf.changed,
+      prfRecordsSkipped: prf.skipped,
+      routeRecordsImported: routes.changed,
+      routeRecordsSkipped: routes.skipped,
+      evaluationSheet: evalExport,
+      prfSheet: prfExport,
+      routingSheet: routeExport,
+      routingSheetName: routeTab,
+      syncedAt: nowIso(),
+      message: "Incremental synchronization completed. Only changed and new records were reconciled.",
+    };
+    return NextResponse.json(result, { headers:{"Cache-Control":"no-store"} });
+  } catch (error:any) {
+    console.error("/api/sync failed at", stage, error);
+    return NextResponse.json({ ok:false, stage, message:error?.message || "Spreadsheet synchronization failed." }, { status:503 });
+  }
+}

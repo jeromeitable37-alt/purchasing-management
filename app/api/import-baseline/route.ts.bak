@@ -1,0 +1,97 @@
+import { NextResponse } from "next/server";
+import * as XLSX from "xlsx";
+import crypto from "node:crypto";
+import { adminDb } from "@/lib/admin";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const now = () => new Date().toISOString();
+function key(v: unknown) { return String(v ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, ""); }
+function pick(row: Record<string, any>, names: string[]) {
+  for (const n of names) { const k = key(n); const hit = Object.keys(row).find(x => key(x) === k); if (hit && String(row[hit] ?? "").trim()) return String(row[hit]).trim(); }
+  return "";
+}
+function num(v: any) { const n = Number(String(v ?? "").replace(/,/g, "")); return Number.isFinite(n) ? n : 0; }
+function stable(prefix: string, value: string) { return `${prefix}-${crypto.createHash("sha1").update(value.trim().toLowerCase()).digest("hex").slice(0, 28)}`; }
+function hash(v: unknown) { return crypto.createHash("sha256").update(JSON.stringify(v)).digest("hex"); }
+async function commit(collection: string, docs: Array<{id:string,data:any}>) {
+  for (let i=0;i<docs.length;i+=400) { const batch = adminDb.batch(); for (const d of docs.slice(i,i+400)) batch.set(adminDb.collection(collection).doc(d.id), d.data, {merge:true}); await batch.commit(); }
+}
+
+function evaluationFromGeneric(row: Record<string, any>, sourceSheet: string) {
+  const po = pick(row,["PO Number","PO No.","PO"]); const vendor = pick(row,["Company Name","Vendor","Supplier","Vendor Name"]); const prf = pick(row,["PRF No.","PRF No","PRF"]); if (!po && !vendor && !prf) return null;
+  const id = pick(row,["System ID","Evaluation ID","_systemId"]) || stable("legacy-eval",`${sourceSheet}|${po}|${vendor}|${pick(row,["Evaluation Date","Date Evaluated"])}`);
+  const overall = num(pick(row,["FINAL RATING","Overall Score","Average","Average Score","AC"]));
+  const date = pick(row,["Evaluation Date","Date Evaluated"]);
+  return { id, token: crypto.randomBytes(24).toString("hex"), poNumber:po, prfNo:prf, vendorName:vendor, supplier:vendor, evaluatorName:pick(row,["Evaluator Name","Requisitioner","Name"]), evaluatorEmail:pick(row,["Evaluator Email","Email"]), evaluatorRole:pick(row,["Evaluator Role","Role"])||"requisitioner", accurateDelivery:num(pick(row,["Accurate Delivery / Quality","Accurate Delivery"])), competitivePrice:num(pick(row,["Competitive Price"])), timeliness:num(pick(row,["Timeliness of Delivery","Timeliness"])), afterSales:num(pick(row,["After Sales Services","After Sales"])), compliance:num(pick(row,["Compliance","Compliance with Regulatory Requirements and School Policies"])), comments:pick(row,["Remarks","Comments"]), overallScore:overall, submittedAt:date, status:(overall||date)?"submitted":"pending", source:`legacy workbook · ${sourceSheet}`, sourceSheet, sourceHash:hash(row), lastExportAt:now(), updatedAt:now(), importedAt:now() };
+}
+
+function evaluationFromDatabaseRow(row: any[], sourceSheet: string, rowNumber: number) {
+  const prf=String(row[0]??"").trim(), po=String(row[1]??"").trim(), vendor=String(row[4]??"").trim();
+  if (!po && !prf && !vendor) return [];
+  const items=String(row[2]??"").trim(), date=String(row[3]??"").trim(), remarks=String(row[6]??"").trim(), overall=num(row[28]);
+  const groups:[string,string,number[]][]=[
+    ["purchasing","Purchasing",[7,8,9,10,11]],
+    ["requisitioner","Requisitioner",[13,14,15,16]],
+    ["amd","AMD",[18,19,20,21]]
+  ];
+  const docs:any[]=[];
+  for (const [role,label,indexes] of groups) {
+    const scores=indexes.map(i=>num(row[i]));
+    if (!scores.some(v=>v>0) && !overall) continue;
+    const id=stable("legacy-eval",`${sourceSheet}|${rowNumber}|${role}`);
+    const final = role === "purchasing" ? overall : (scores.filter(v=>v>0).length ? Math.round(scores.filter(v=>v>0).reduce((a,b)=>a+b,0)/scores.filter(v=>v>0).length*10)/10 : overall);
+    docs.push({id,token:crypto.randomBytes(24).toString("hex"),poNumber:po,prfNo:prf,vendorName:vendor,supplier:vendor,evaluatorRole:role,evaluatorName:label,accurateDelivery:scores[0]||0,competitivePrice:scores[1]||0,timeliness:scores[2]||0,afterSales:scores[3]||0,compliance:scores[4]||0,comments:remarks,overallScore:final,submittedAt:date,status:(final||date)?"submitted":"pending",itemsDelivered:items,source:`legacy workbook · ${sourceSheet}`,sourceSheet,sourceRow:rowNumber,sourceHash:hash(row),lastExportAt:now(),updatedAt:now(),importedAt:now(),legacyFinalRating:overall,legacyAverage:label === "Purchasing" ? num(row[12]) : label === "Requisitioner" ? num(row[17]) : num(row[22]),legacyRecommendation:String(row[29]??"")});
+  }
+  return docs;
+}
+
+function buildRoutes(rows: Record<string,any>[], sheet:string) {
+  return rows.map((r,i)=>{
+    const prf=pick(r,["PRF NO.","PRF No","PRF"]), po=pick(r,["PO NUMBER","PO Number","PO No.","PO"]); if(!prf&&!po) return null;
+    const id=stable("route",`${sheet}|${prf||po}`);
+    const actual=pick(r,["ACTUAL DELIVERY DATE"]);
+    const status=pick(r,["STATUS IN PURCHASING","PRF Status","Status"]) || (actual?"Completed":"For Routing");
+    const history:any[]=[]; const add=(action:string, field:string, extra:any={})=>{const v=pick(r,[field]); if(v) history.push({timestamp:v,action,...extra});};
+    add("PRF received by AMD","DATE RECEIVED BY AMD"); add("Canvassing started","DATE START PROCESSING/ CANVASSING"); add("Canvassing completed","DATE END CANVASSED"); add("Fully approved PRF received","DATE RECEIVED OF FULLY APPROVED PRF"); add("PO created","DATE OF PO",{status}); add("PO forwarded to AMD / Accounting","DATE OF PO FORWARDED TO AMD AND ACCTNG"); add("Delivery date","Delivery Date"); add("Actual delivery","ACTUAL DELIVERY DATE",{status:"Delivered",currentHolder:pick(r,["DELIVERY RECEIVED BY"])}); add("Forwarded to Accounting","DATE forwarded to Accounting"); add("Received by requisitioner","DATE RECEIVED BY REQUISITIONER");
+    return {id,trackingId:`RT-${(po||prf).replace(/\s+/g,"-")}`,documentType:sheet.toUpperCase().startsWith("SRF")?"SRF":"PRF",referenceNo:prf||po,prfNo:prf,poNumber:po,documentTitle:pick(r,["ITEM DESCRIPTION"]),requester:pick(r,["REQUISITIONER"]),department:pick(r,["DEPARTMENT"]),from:"Purchasing",to:actual?"Requisitioner":"Purchasing",currentHolder:actual?pick(r,["DELIVERY RECEIVED BY"]):pick(r,["Purchaser Assigned"])||"Purchasing",status,dateRouted:pick(r,["DATE RECEIVED BY AMD","DATE OF PO"]),dateReceived:pick(r,["DATE RECEIVED OF FULLY APPROVED PRF","Date Received"]),receivedBy:pick(r,["DELIVERY RECEIVED BY"]),remarks:pick(r,["REMARKS","AMD REMARKS","AC"]),history:history.sort((a,b)=>String(a.timestamp).localeCompare(String(b.timestamp))),source:`legacy workbook · ${sheet}`,sourceSheet:sheet,sourceRow:i+1,sourceHash:hash(r),lastExportAt:now(),updatedAt:now(),importedAt:now()};
+  }).filter(Boolean);
+}
+
+export async function POST(req: Request) {
+  try {
+    const form = await req.formData();
+    const file = form.get("file"); const kind = String(form.get("kind") || "");
+    if (!(file instanceof File)) return NextResponse.json({ok:false,message:"Excel file is required."},{status:400});
+    if (!file.name.toLowerCase().match(/\.(xlsx|xls|xlsm)$/)) return NextResponse.json({ok:false,message:"Upload an Excel workbook (.xlsx/.xls/.xlsm)."},{status:400});
+    const bytes = await file.arrayBuffer(); const wb = XLSX.read(Buffer.from(bytes), {type:"buffer", cellDates:false, raw:true});
+    if (kind === "evaluation") {
+      const preferred = ["PO for Evaluation","Copy of DATABASE","DATABASE1","DATABASE","SEARCH"];
+      const docs:any[]=[]; let sheetUsed="";
+      for (const name of preferred) if (wb.Sheets[name]) {
+        sheetUsed=name;
+        const matrix:any[][]=XLSX.utils.sheet_to_json(wb.Sheets[name],{header:1,raw:true,defval:""});
+        const isDb=/DATABASE|SEARCH/i.test(name);
+        if (isDb) for (let i=2;i<matrix.length;i++) docs.push(...evaluationFromDatabaseRow(matrix[i],name,i+1));
+        else {
+          const headers=(matrix[0]||[]).map(v=>String(v??""));
+          for(let i=1;i<matrix.length;i++){const row:any={}; headers.forEach((h,j)=>{if(h) row[h]=matrix[i][j]??""}); const doc=evaluationFromGeneric(row,name); if(doc) docs.push(doc);}
+        }
+        break;
+      }
+      await commit("evaluations",docs.map(d=>({id:d.id,data:d}))); return NextResponse.json({ok:true,kind,sourceFile:file.name,sheet:sheetUsed,recordsImported:docs.length,message:`Imported ${docs.length} historical supplier-evaluation records. Future syncs will process only changes/new records.`});
+    }
+    if (kind === "routing") {
+      const preferred=["PRF - SISC","SRF - SISC"]; const docs:any[]=[];
+      for (const name of preferred) if (wb.Sheets[name]) {
+        const matrix:any[][]=XLSX.utils.sheet_to_json(wb.Sheets[name],{header:1,raw:true,defval:""});
+        const headerIndex=Math.max(0,matrix.findIndex(r=>r.some((v:any)=>/PRF\s*NO|PO\s*NUMBER|REQUISITIONER/i.test(String(v??"")))));
+        const headers=(matrix[headerIndex]||[]).map(v=>String(v??"")); const rows:any[]=[];
+        for(let i=headerIndex+1;i<matrix.length;i++){const r:any={};headers.forEach((h,j)=>{if(h) r[h]=matrix[i][j]??""}); if(Object.values(r).some(v=>String(v??"").trim())) rows.push(r);} docs.push(...buildRoutes(rows,name));
+      }
+      await commit("routes",docs.map((d:any)=>({id:d.id,data:d}))); return NextResponse.json({ok:true,kind,sourceFile:file.name,recordsImported:docs.length,message:`Imported ${docs.length} historical RouteTrack records. Future syncs will process only changes/new records.`});
+    }
+    return NextResponse.json({ok:false,message:"Unknown baseline import type."},{status:400});
+  } catch (error:any) { console.error("/api/import-baseline",error); return NextResponse.json({ok:false,message:error?.message||"Baseline import failed."},{status:500}); }
+}
