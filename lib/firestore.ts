@@ -1,6 +1,6 @@
 import {
   collection, doc, getDoc, getDocs, onSnapshot, orderBy, query, setDoc, updateDoc,
-  deleteDoc, where, limit, Timestamp, startAfter, type DocumentData, type QueryDocumentSnapshot
+  deleteDoc, where, limit, Timestamp
 } from "firebase/firestore";
 import { db } from "./firebase";
 
@@ -36,7 +36,7 @@ export type RouteHistoryEntry = {
 };
 
 export type RouteRecord = {
-  id: string; trackingId: string; documentType: string; referenceNo: string; prfNo?: string; poNumber?: string;
+  id: string; trackingId: string; documentType: string; referenceNo: string; prfNo?: string; srfNo?: string; poNumber?: string;
   documentTitle?: string; requester?: string; department?: string; from?: string; to?: string;
   currentHolder?: string; status: string; dateRouted?: string; dateReceived?: string;
   receivedBy?: string; dateReturned?: string; remarks?: string; source?: string;
@@ -75,61 +75,13 @@ export function listenCollection<T>(name: string, onNext: (data: T[]) => void, o
   return onSnapshot(q, s => onNext(s.docs.map(d => ({ id: d.id, ...d.data() }) as T)), onError);
 }
 
-export function listenRecentCollection<T>(
-  name: string,
-  onNext: (data: T[], lastDoc: QueryDocumentSnapshot<DocumentData> | null) => void,
-  onError?: (e: any) => void,
-  pageSize = 100
-) {
-  const q = query(
-    collection(db, name),
-    orderBy("updatedAt", "desc"),
-    limit(pageSize)
-  );
-  return onSnapshot(
-    q,
-    s => onNext(
-      s.docs.map(d => ({ id: d.id, ...d.data() }) as T),
-      s.docs.length ? s.docs[s.docs.length - 1] : null
-    ),
-    onError
-  );
-}
-
 export async function getCollection<T>(name: string) {
   const snap = await getDocs(collection(db, name));
   return snap.docs.map(d => ({ id: d.id, ...d.data() }) as T);
 }
 
-export async function getCollectionPage<T>(
-  name: string,
-  cursor: QueryDocumentSnapshot<DocumentData> | null,
-  pageSize = 100
-): Promise<{ data: T[]; cursor: QueryDocumentSnapshot<DocumentData> | null; hasMore: boolean }> {
-  const constraints: any[] = [
-    orderBy("updatedAt", "desc"),
-    limit(pageSize)
-  ];
-  if (cursor) constraints.splice(1, 0, startAfter(cursor));
-  const q = query(collection(db, name), ...constraints);
-  const snap = await getDocs(q);
-  return {
-    data: snap.docs.map(d => ({ id: d.id, ...d.data() }) as T),
-    cursor: snap.docs.length ? snap.docs[snap.docs.length - 1] : cursor,
-    hasMore: snap.docs.length === pageSize
-  };
-}
-
-const SYNC_TRACKED_COLLECTIONS = new Set(["evaluations", "prfDetails", "routes"]);
-
 export async function saveEntity<T extends { id: string }>(name: string, value: T) {
-  const syncTracked = SYNC_TRACKED_COLLECTIONS.has(name);
-  const payload: Record<string, any> = {
-    ...value,
-    updatedAt: (value as any).updatedAt || now(),
-  };
-  if (syncTracked) payload.needsExport = true;
-  await setDoc(doc(db, name, value.id), payload, { merge: true });
+  await setDoc(doc(db, name, value.id), { ...value, updatedAt: (value as any).updatedAt || now() }, { merge: true });
   return value;
 }
 export async function removeEntity(name: string, id: string) { await deleteDoc(doc(db, name, id)); }
