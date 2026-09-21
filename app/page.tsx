@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type ReactNode, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   Archive,
   Activity,
@@ -14,7 +14,6 @@ import {
   ClipboardCheck,
   ClipboardList,
   Cloud,
-  Database,
   FileText,
   FolderOpen,
   Home,
@@ -54,9 +53,7 @@ import {
 import {
   ensureProfile,
   listenCollection,
-  listenRecentCollection,
   getCollection,
-  getCollectionPage,
   saveEntity,
   removeEntity,
   uid,
@@ -86,7 +83,6 @@ type View =
   | "documents"
   | "reports"
   | "sync"
-  | "data"
   | "settings"
   | "admin";
 
@@ -104,6 +100,9 @@ export default function HomePage() {
   const [workspaceMode, setWorkspaceMode] =
     useState<"user" | "admin">("user");
 
+  const [adminSection, setAdminSection] =
+    useState<AdminSection>("dashboard");
+
   const [mobileOpen, setMobileOpen] =
     useState(false);
 
@@ -112,8 +111,6 @@ export default function HomePage() {
 
   const [syncing, setSyncing] =
     useState(false);
-
-  const syncInFlight = useRef<Promise<void> | null>(null);
 
   const [toast, setToast] =
     useState("");
@@ -135,118 +132,6 @@ export default function HomePage() {
 
   const [docs, setDocs] =
     useState<DocumentRecord[]>([]);
-
-  const [buyers, setBuyers] =
-    useState<Buyer[]>([]);
-
-  const [employees, setEmployees] =
-    useState<Employee[]>([]);
-
-  const [addresses, setAddresses] =
-    useState<Address[]>([]);
-
-  const [prfDetails, setPrfDetails] =
-    useState<any[]>([]);
-
-  /* -------------------------------------------------------
-     PAGED FIRESTORE WINDOWS
-     Large collections stay live in a small recent window.
-     Older records are fetched only when the user asks for them.
-  ------------------------------------------------------- */
-  const pageCursors = useRef<Record<string, any>>({});
-  const pageHasMore = useRef<Record<string, boolean>>({});
-  const pageExpanded = useRef<Set<string>>(new Set());
-  const pageLoading = useRef<Record<string, boolean>>({});
-  const [pageState, setPageState] = useState<Record<string, { loaded: number; hasMore: boolean }>>({});
-
-  const PAGE_SIZES: Record<string, number> = {
-    purchaseRequests: 75,
-    purchaseOrders: 75,
-    routes: 100,
-    evaluations: 100,
-    prfDetails: 150,
-    documents: 50
-  };
-
-  function mergeRecords<T extends { id: string }>(current: T[], incoming: T[]) {
-    const byId = new Map(current.map(item => [item.id, item] as const));
-    incoming.forEach(item => byId.set(item.id, { ...(byId.get(item.id) ?? {}), ...item }));
-    return Array.from(byId.values()).sort((a: any, b: any) =>
-      String(b.updatedAt || b.createdAt || "").localeCompare(String(a.updatedAt || a.createdAt || ""))
-    );
-  }
-
-  function registerRecentWindow<T extends { id: string }>(
-    name: string,
-    setter: Dispatch<SetStateAction<T[]>>,
-    errorLabel: string
-  ) {
-    const pageSize = PAGE_SIZES[name] || 100;
-    return listenRecentCollection<T>(
-      name,
-      (incoming, lastDoc) => {
-        if (!pageExpanded.current.has(name)) {
-          pageCursors.current[name] = lastDoc;
-          pageHasMore.current[name] = incoming.length === pageSize;
-        }
-        setter(current => {
-          const merged = mergeRecords(current, incoming);
-          return pageExpanded.current.has(name) ? merged : merged.slice(0, pageSize);
-        });
-        setPageState(current => ({
-          ...current,
-          [name]: {
-            loaded: pageExpanded.current.has(name) ? Math.max(current[name]?.loaded || 0, incoming.length) : incoming.length,
-            hasMore: pageHasMore.current[name] ?? incoming.length === pageSize
-          }
-        }));
-      },
-      error => console.error(`${errorLabel} listener:`, error),
-      pageSize
-    );
-  }
-
-  async function loadOlderCollection<T extends { id: string }>(
-    name: string,
-    setter: Dispatch<SetStateAction<T[]>>
-  ) {
-    if (pageLoading.current[name] || !pageHasMore.current[name] || !pageCursors.current[name]) return;
-    pageLoading.current[name] = true;
-    pageExpanded.current.add(name);
-    try {
-      const pageSize = PAGE_SIZES[name] || 100;
-      const result = await getCollectionPage<T>(name, pageCursors.current[name], pageSize);
-      pageCursors.current[name] = result.cursor;
-      pageHasMore.current[name] = result.hasMore;
-      setter(current => mergeRecords(current, result.data));
-      setPageState(current => ({
-        ...current,
-        [name]: {
-          loaded: (current[name]?.loaded || 0) + result.data.length,
-          hasMore: result.hasMore
-        }
-      }));
-    } catch (error) {
-      console.error(`Could not load older ${name} records:`, error);
-      pageExpanded.current.delete(name);
-      throw error;
-    } finally {
-      pageLoading.current[name] = false;
-    }
-  }
-
-  function pageConfigForView(currentView: View) {
-    const configs: Partial<Record<View, { name: string; label: string; setter: Dispatch<SetStateAction<any[]>> }>> = {
-      requests: { name: "purchaseRequests", label: "purchase requests", setter: setRequests },
-      orders: { name: "purchaseOrders", label: "purchase orders", setter: setOrders },
-      deliveries: { name: "purchaseOrders", label: "purchase orders", setter: setOrders },
-      routing: { name: "routes", label: "routing records", setter: setRoutes },
-      evaluations: { name: "evaluations", label: "supplier evaluations", setter: setEvals },
-      documents: { name: "documents", label: "documents", setter: setDocs },
-      reports: { name: "evaluations", label: "evaluation history", setter: setEvals }
-    };
-    return configs[currentView];
-  }
 
   /* -------------------------------------------------------
      TOAST
@@ -368,13 +253,49 @@ export default function HomePage() {
   useEffect(() => {
     if (!user) return;
 
-    const unsubscribeRequests = registerRecentWindow<PurchaseRequest>("purchaseRequests", setRequests, "Purchase request");
+    const unsubscribeRequests =
+      listenCollection<PurchaseRequest>(
+        "purchaseRequests",
+        setRequests,
+        (error) =>
+          console.error(
+            "Purchase request listener:",
+            error
+          )
+      );
 
-    const unsubscribeOrders = registerRecentWindow<PurchaseOrder>("purchaseOrders", setOrders, "Purchase order");
+    const unsubscribeOrders =
+      listenCollection<PurchaseOrder>(
+        "purchaseOrders",
+        setOrders,
+        (error) =>
+          console.error(
+            "Purchase order listener:",
+            error
+          )
+      );
 
-    const unsubscribeRoutes = registerRecentWindow<RouteRecord>("routes", setRoutes, "Route");
+    const unsubscribeRoutes =
+      listenCollection<RouteRecord>(
+        "routes",
+        setRoutes,
+        (error) =>
+          console.error(
+            "Route listener:",
+            error
+          )
+      );
 
-    const unsubscribeEvaluations = registerRecentWindow<SupplierEvaluation>("evaluations", setEvals, "Evaluation");
+    const unsubscribeEvaluations =
+      listenCollection<SupplierEvaluation>(
+        "evaluations",
+        setEvals,
+        (error) =>
+          console.error(
+            "Evaluation listener:",
+            error
+          )
+      );
 
     const unsubscribeSuppliers =
       listenCollection<Supplier>(
@@ -387,55 +308,28 @@ export default function HomePage() {
           )
       );
 
-    const unsubscribeDocuments = registerRecentWindow<DocumentRecord>("documents", setDocs, "Document");
-
-    const unsubscribeBuyers =
-      listenCollection<Buyer>(
-        "buyers",
-        setBuyers,
-        (error) => console.error("Buyer listener:", error)
+    const unsubscribeDocuments =
+      listenCollection<DocumentRecord>(
+        "documents",
+        setDocs,
+        (error) =>
+          console.error(
+            "Document listener:",
+            error
+          )
       );
-
-    const unsubscribeEmployees =
-      listenCollection<Employee>(
-        "employees",
-        setEmployees,
-        (error) => console.error("Employee listener:", error)
-      );
-
-    const unsubscribeAddresses =
-      listenCollection<Address>(
-        "addresses",
-        setAddresses,
-        (error) => console.error("Address listener:", error)
-      );
-
-    const unsubscribePrfDetails = registerRecentWindow<any>("prfDetails", setPrfDetails, "PRF details");
 
     /* -----------------------------------------------------
        AUTOMATIC MONITORING SYNC
        Run once on workspace load, then every 15 minutes.
     ----------------------------------------------------- */
 
-    const AUTO_SYNC_KEY = "pms:last-successful-sync";
-    const AUTO_SYNC_COOLDOWN_KEY = "pms:sync-quota-paused-until";
-    const shouldAutoSync = () => {
-      const pausedUntil = Number(window.localStorage.getItem(AUTO_SYNC_COOLDOWN_KEY) || 0);
-      if (pausedUntil && Date.now() < pausedUntil) return false;
-      const last = Number(window.localStorage.getItem(AUTO_SYNC_KEY) || 0);
-      return !last || (Date.now() - last) > 15 * 60 * 1000;
-    };
-    const initialSync = window.setTimeout(() => { if (shouldAutoSync()) void syncNow(true); }, 1200);
+    const initialSync = window.setTimeout(() => { void syncNow(true); }, 1200);
     const timer = window.setInterval(() => {
-      if (shouldAutoSync()) void syncNow(true);
+      void syncNow(true);
     }, 15 * 60 * 1000);
 
     return () => {
-      pageCursors.current = {};
-      pageHasMore.current = {};
-      pageExpanded.current = new Set();
-      pageLoading.current = {};
-      setPageState({});
       try {
         unsubscribeRequests();
       } catch {}
@@ -459,10 +353,6 @@ export default function HomePage() {
       try {
         unsubscribeDocuments();
       } catch {}
-      try { unsubscribeBuyers(); } catch {}
-      try { unsubscribeEmployees(); } catch {}
-      try { unsubscribeAddresses(); } catch {}
-      try { unsubscribePrfDetails(); } catch {}
 
       window.clearTimeout(initialSync);
       window.clearInterval(timer);
@@ -476,16 +366,9 @@ export default function HomePage() {
   async function syncNow(
     silent = false
   ) {
-    // Prevent the automatic startup sync, 15-minute timer, and a manual click
-    // from running several large spreadsheet reconciliations at once.
-    if (syncInFlight.current) {
-      return syncInFlight.current;
-    }
+    setSyncing(true);
 
-    const run = (async () => {
-      setSyncing(true);
-
-      try {
+    try {
       /*
        * IMPORTANT:
        * Do not expose CRON_SECRET or any secret
@@ -550,21 +433,15 @@ export default function HomePage() {
         !response.ok ||
         !data?.ok
       ) {
-        if (data?.code === "RESOURCE_EXHAUSTED") {
-          window.localStorage.setItem("pms:sync-quota-paused-until", String(Date.now() + 6 * 60 * 60 * 1000));
-        }
         throw new Error(
           data?.message ||
             "Spreadsheet synchronization failed."
         );
       }
 
-      window.localStorage.setItem("pms:last-successful-sync", String(Date.now()));
-      window.localStorage.removeItem("pms:sync-quota-paused-until");
-
       if (!silent) {
         notify(
-          `Sync completed: ${data.evaluationRecordsImported ?? 0} evaluation rows, ${data.prfRecordsImported ?? 0} PRF rows and ${data.routeRecordsImported ?? 0} route rows imported; ${data.masterData?.employees?.changed ?? 0} employees, ${data.masterData?.buyers?.changed ?? 0} buyers and ${data.masterData?.suppliers?.changed ?? 0} suppliers refreshed; ${data.evaluationSheet?.updated ?? 0} evaluation, ${data.prfSheet?.updated ?? 0} PRF and ${data.routingSheet?.updated ?? 0} routing rows updated.`
+          `Sync completed: ${data.evaluationRecordsImported ?? 0} evaluation rows, ${data.prfRecordsImported ?? 0} PRF rows and ${data.routeRecordsImported ?? 0} route rows imported; ${data.evaluationSheet?.updated ?? 0} evaluation, ${data.prfSheet?.updated ?? 0} PRF and ${data.routingSheet?.updated ?? 0} routing rows updated.`
         );
       }
     } catch (error: any) {
@@ -579,16 +456,8 @@ export default function HomePage() {
             "Synchronization failed."
         );
       }
-      } finally {
-        setSyncing(false);
-      }
-    })();
-
-    syncInFlight.current = run;
-    try {
-      await run;
     } finally {
-      if (syncInFlight.current === run) syncInFlight.current = null;
+      setSyncing(false);
     }
   }
 
@@ -706,12 +575,6 @@ export default function HomePage() {
         onSync={() => void syncNow()}
         syncing={syncing}
         onOpenUserWorkspace={(targetView = "dashboard") => { setView(targetView); setWorkspaceMode("user"); }}
-        onLoadOlder={async () => {
-          await loadOlderCollection("purchaseRequests", setRequests);
-          await loadOlderCollection("purchaseOrders", setOrders);
-          await loadOlderCollection("routes", setRoutes);
-          await loadOlderCollection("evaluations", setEvals);
-        }}
       />
     );
   }
@@ -913,13 +776,6 @@ export default function HomePage() {
             }
           />
 
-          <Nav
-            label="Data Center"
-            icon={<Database />}
-            active={view === "data"}
-            onClick={() => navigate("data")}
-          />
-
           {profile?.role === "admin" && (
             <Nav
               label="Open Admin Console"
@@ -1057,25 +913,6 @@ export default function HomePage() {
 
         <div className="content">
 
-          {(() => {
-            const cfg = pageConfigForView(view);
-            if (!cfg) return null;
-            const meta = pageState[cfg.name];
-            if (!meta?.hasMore) return null;
-            const loading = !!pageLoading.current[cfg.name];
-            return (
-              <div className="data-window-banner" role="status">
-                <div>
-                  <b>Showing recent {meta.loaded} {cfg.label}</b>
-                  <span>Older records are loaded on demand to reduce Firestore reads.</span>
-                </div>
-                <button className="btn ghost" type="button" disabled={loading} onClick={() => void loadOlderCollection(cfg.name, cfg.setter).catch(error => notify(error?.message || "Could not load older records."))}>
-                  {loading ? "Loading…" : "Load older records"}
-                </button>
-              </div>
-            );
-          })()}
-
           {view ===
             "dashboard" && (
             <Dashboard
@@ -1174,9 +1011,6 @@ export default function HomePage() {
               suppliers={
                 suppliers
               }
-              buyers={buyers}
-              employees={employees}
-              prfDetails={prfDetails}
               onSave={(item) =>
                 saveEntity(
                   "purchaseOrders",
@@ -1243,7 +1077,6 @@ export default function HomePage() {
               orders={
                 orders
               }
-              employees={employees}
               onSave={(item) =>
                 saveEntity(
                   "evaluations",
@@ -1303,11 +1136,6 @@ export default function HomePage() {
           )}
 
           {view ===
-            "data" && (
-            <SpreadsheetDataHub onError={notify} />
-          )}
-
-          {view ===
             "sync" && (
             <SyncPage
               routes={
@@ -1326,6 +1154,8 @@ export default function HomePage() {
             "admin" &&
             profile?.role === "admin" && (
             <AdminOperations
+              section={adminSection}
+              onSectionChange={setAdminSection}
               routes={routes}
               evals={evals}
               orders={orders}
@@ -2337,18 +2167,12 @@ function CrudPage({
 function OrdersPage({
   orders,
   suppliers,
-  buyers,
-  employees,
-  prfDetails,
   onSave,
   onDelete,
   onError
 }: {
   orders: PurchaseOrder[];
   suppliers: Supplier[];
-  buyers: Buyer[];
-  employees: Employee[];
-  prfDetails: any[];
   onSave: (item: any) => Promise<any>;
   onDelete: (id: string) => Promise<any>;
   onError: (message: string) => void;
@@ -2465,39 +2289,6 @@ function OrdersPage({
     }
   }
 
-  function applyPRFLookup(value: string) {
-    const key = String(value || "").trim().toLowerCase();
-    const row = prfDetails.find((r:any) => String(r["PRF NO."] || r["PRF No"] || r["PRF"] || r["_systemId"] || "").trim().toLowerCase() === key);
-    if (!row) {
-      setDraft((current:any)=>({...current, prfNo:value}));
-      return;
-    }
-    const reqName = String(row["REQUISITIONER"] || row["Requester"] || "").trim();
-    const department = String(row["DEPARTMENT"] || row["Department"] || "").trim();
-    const purpose = String(row["PURPOSE"] || row["Purpose"] || "").trim();
-    const itemDescription = String(row["ITEM DESCRIPTION"] || row["Item Description"] || row["SCOPE OF WORK"] || "").trim();
-    const emp = employees.find((e)=>String(e.name||"").trim().toLowerCase()===reqName.toLowerCase());
-    setDraft((current:any)=>({
-      ...current,
-      prfNo: String(row["PRF NO."] || row["PRF No"] || value),
-      requisitioner: reqName || current.requisitioner,
-      requisitionerEmail: emp?.email || current.requisitionerEmail || "",
-      purpose: purpose || current.purpose,
-      department,
-      items: itemDescription ? [{...blankItem, particulars:itemDescription}] : (current.items || [{...blankItem}]),
-    }));
-  }
-
-  function applySupplierLookup(value: string) {
-    const s = suppliers.find((item)=>item.name.trim().toLowerCase()===String(value||"").trim().toLowerCase());
-    setDraft((current:any)=>({...current, vendorName:value, supplierAddress:s?.address || current.supplierAddress || "", supplierContact:s?.contact || current.supplierContact || ""}));
-  }
-
-  function applyEmployeeLookup(value: string) {
-    const e = employees.find((item)=>item.name.trim().toLowerCase()===String(value||"").trim().toLowerCase());
-    setDraft((current:any)=>({...current, requisitioner:value, requisitionerEmail:e?.email || current.requisitionerEmail || ""}));
-  }
-
   function openNew() {
     setDraft({
       status: "Draft",
@@ -2566,15 +2357,13 @@ function OrdersPage({
           <div className="form-grid">
             <div className="form-2">
               <label className="form-label">PO Number<input className="field" value={draft.poNumber || ""} onChange={(e) => setDraft({...draft, poNumber:e.target.value})} placeholder="e.g. TPF0736" /></label>
-              <label className="form-label">PRF No. <span style={{fontSize:11,color:"#0f766e"}}>↳ spreadsheet lookup</span><input className="field" list="prf-source-list" value={draft.prfNo || ""} onChange={(e) => applyPRFLookup(e.target.value)} placeholder="Select / type PRF No." /></label>
-              <datalist id="prf-source-list">{prfDetails.slice(0,3000).map((r:any,i:number)=>{const n=String(r["PRF NO."]||r["PRF No"]||r["PRF"]||"").trim();return n?<option key={`${n}-${i}`} value={n} />:null})}</datalist>
+              <label className="form-label">PRF No.<input className="field" value={draft.prfNo || ""} onChange={(e) => setDraft({...draft, prfNo:e.target.value})} /></label>
             </div>
             <div className="form-2">
-              <label className="form-label">Supplier<input className="field" list="supplier-list" value={draft.vendorName || ""} onChange={(e) => applySupplierLookup(e.target.value)} /></label>
+              <label className="form-label">Supplier<input className="field" list="supplier-list" value={draft.vendorName || ""} onChange={(e) => setDraft({...draft, vendorName:e.target.value})} /></label>
               <label className="form-label">Supplier Contact / Attention<input className="field" value={draft.supplierContact || ""} onChange={(e) => setDraft({...draft, supplierContact:e.target.value})} /></label>
             </div>
-            <datalist id="supplier-list">{suppliers.slice(0,3000).map((supplier)=><option key={supplier.id} value={supplier.name} />)}</datalist>
-            <div style={{fontSize:11,color:"#64748b",marginTop:-6}}>Supplier, requisitioner, buyer, and PRF suggestions come from synchronized spreadsheet data. Select a value to auto-fill related fields.</div>
+            <datalist id="supplier-list">{suppliers.map((supplier)=><option key={supplier.id} value={supplier.name} />)}</datalist>
             <label className="form-label">Supplier Address<input className="field" value={draft.supplierAddress || ""} onChange={(e) => setDraft({...draft, supplierAddress:e.target.value})} /></label>
             <div className="form-2">
               <label className="form-label">PO Date<input className="field" type="date" value={draft.poDate || ""} onChange={(e) => setDraft({...draft, poDate:e.target.value})} /></label>
@@ -2585,13 +2374,11 @@ function OrdersPage({
               <label className="form-label">Status<select className="field" value={draft.status || "Draft"} onChange={(e) => setDraft({...draft, status:e.target.value})}><option>Draft</option><option>Pending</option><option>Approved</option><option>Received</option><option>Delivered</option><option>Completed</option><option>Cancelled</option></select></label>
             </div>
             <div className="form-2">
-              <label className="form-label">Requisitioner<input className="field" list="employee-list" value={draft.requisitioner || ""} onChange={(e) => applyEmployeeLookup(e.target.value)} /></label>
-              <datalist id="employee-list">{employees.slice(0,3000).map((e)=><option key={e.id} value={e.name}>{e.email || ""}</option>)}</datalist>
+              <label className="form-label">Requisitioner<input className="field" value={draft.requisitioner || ""} onChange={(e) => setDraft({...draft, requisitioner:e.target.value})} /></label>
               <label className="form-label">Requisitioner Email<input className="field" type="email" value={draft.requisitionerEmail || ""} onChange={(e) => setDraft({...draft, requisitionerEmail:e.target.value})} placeholder="name@company.com" /></label>
             </div>
             <div className="form-2">
-              <label className="form-label">Buyer / Prepared By<input className="field" list="buyer-list" value={draft.buyerName || ""} onChange={(e) => setDraft({...draft, buyerName:e.target.value})} /></label>
-              <datalist id="buyer-list">{buyers.slice(0,3000).map((b)=><option key={b.id} value={b.name}>{b.email || ""}</option>)}</datalist>
+              <label className="form-label">Buyer / Prepared By<input className="field" value={draft.buyerName || ""} onChange={(e) => setDraft({...draft, buyerName:e.target.value})} /></label>
               <label className="form-label">Purpose<input className="field" value={draft.purpose || ""} onChange={(e) => setDraft({...draft, purpose:e.target.value})} placeholder="FOR SALE IN STUFFSHOP" /></label>
             </div>
 
@@ -2691,24 +2478,6 @@ function RoutingPage({
     return matchesQuery && matchesStatus;
   });
 
-  function applyRouteLookup(value: string) {
-    const key = String(value || "").trim().toLowerCase();
-    const found = routes.find((r) => [r.referenceNo, r.prfNo, r.srfNo, r.poNumber, r.trackingId].some(v => String(v || "").trim().toLowerCase() === key));
-    if (!found) {
-      setDraft((current:any)=>({...current, referenceNo:value}));
-      return;
-    }
-    setDraft((current:any)=>({
-      ...current,
-      ...found,
-      id: "",
-      trackingId: "",
-      history: undefined,
-      source: "manual-from-synced-record",
-      status: found.status || current.status || "For Routing"
-    }));
-  }
-
   function openNew() {
     setDraft({ status: "For Routing", documentType: "PO", from: "Purchasing" });
     setOpen(true);
@@ -2764,7 +2533,7 @@ function RoutingPage({
       <div className="card" style={{marginBottom:16}}><div className="row-actions" style={{padding:14,flexWrap:"wrap"}}><input className="field" style={{maxWidth:320}} placeholder="Search tracking / PO / PRF / holder" value={queryText} onChange={e=>setQueryText(e.target.value)} /><select className="field" style={{maxWidth:200}} value={statusFilter} onChange={e=>setStatusFilter(e.target.value)}><option value="all">All statuses</option>{["Pending","For Routing","Received","In Process","Returned","Completed","Overdue","Cancelled"].map(x=><option key={x}>{x}</option>)}</select><span style={{fontSize:12,color:"#64748b"}}>{filtered.length} record(s)</span></div></div>
       <div className="card"><div className="table-wrap"><table><thead><tr><th>Tracking</th><th>Document</th><th>Reference</th><th>From → To</th><th>Holder</th><th>Status</th><th>Received</th><th>Updated</th><th>Actions</th></tr></thead><tbody>{filtered.map(route=><tr key={route.id}><td className="mono">{route.trackingId}</td><td>{route.documentType}</td><td>{route.referenceNo || route.poNumber || route.prfNo || "—"}</td><td>{route.from || "—"} → {route.to || "—"}</td><td>{route.currentHolder || "—"}</td><td><span className={`badge ${route.status === "Overdue" ? "red" : route.status === "Completed" ? "green" : route.status === "Returned" ? "amber" : "blue"}`}>{route.status}</span></td><td>{route.dateReceived || "—"}</td><td>{route.updatedAt?.slice(0,16).replace("T"," ") || "—"}</td><td><div className="row-actions"><button className="btn xs" onClick={()=>setSelected(route)} type="button">View</button><button className="btn xs" onClick={()=>openEdit(route)} type="button">Edit</button><button className="btn xs" onClick={()=>void remove(route.id)} type="button">Delete</button></div></td></tr>)}</tbody></table>{!filtered.length && <Empty text="No routing records match your filter." />}</div></div>
       {selected && <Modal title={`Route ${selected.trackingId}`} onClose={()=>setSelected(null)}><div className="info-grid"><div className="info-box"><div className="info-lbl">Document</div><div>{selected.documentType} · {selected.referenceNo || selected.poNumber || selected.prfNo || "—"}</div></div><div className="info-box"><div className="info-lbl">Current Holder</div><div>{selected.currentHolder || "—"}</div></div><div className="info-box"><div className="info-lbl">From</div><div>{selected.from || "—"}</div></div><div className="info-box"><div className="info-lbl">To</div><div>{selected.to || "—"}</div></div><div className="info-box"><div className="info-lbl">Received By</div><div>{selected.receivedBy || "—"}</div></div><div className="info-box"><div className="info-lbl">Remarks</div><div>{selected.remarks || "—"}</div></div></div><div className="section-label">Route History</div><div style={{display:"grid",gap:10}}>{(selected.history || []).slice().reverse().map((h,i)=><div key={i} style={{padding:12,border:"1px solid #e5e7eb",borderRadius:10,background:"#f8fafc"}}><div style={{display:"flex",justifyContent:"space-between",gap:12}}><b>{h.action}</b><span style={{fontSize:11,color:"#64748b"}}>{String(h.timestamp||"").replace("T"," ").slice(0,19)}</span></div><div style={{fontSize:12,color:"#475569",marginTop:4}}>{h.from || "—"} → {h.to || "—"} · {h.currentHolder || "—"} · {h.status || "—"}</div>{h.remarks && <div style={{fontSize:12,color:"#64748b",marginTop:4}}>{h.remarks}</div>}</div>)}{!(selected.history||[]).length && <div style={{fontSize:13,color:"#94a3b8"}}>No route history recorded yet.</div>}</div><div className="modal-actions"><button className="btn ghost" onClick={()=>setSelected(null)} type="button">Close</button><button className="btn primary" onClick={()=>openEdit(selected)} type="button">Edit Route</button></div></Modal>}
-      {open && <Modal title={draft.id ? "Edit Routing Record" : "Add Routing Record"} onClose={()=>setOpen(false)}><div className="form-grid"><div className="form-2"><label className="form-label">Tracking ID<input className="field" value={draft.trackingId||""} onChange={e=>setDraft({...draft,trackingId:e.target.value})} /></label><label className="form-label">Document Type<input className="field" value={draft.documentType||"PO"} onChange={e=>setDraft({...draft,documentType:e.target.value})} /></label></div><div className="form-2"><label className="form-label">Reference No. / Load V2 Record<input className="field" list="route-reference-list" value={draft.referenceNo||""} onChange={e=>applyRouteLookup(e.target.value)} placeholder="PRF / SRF / PO / Tracking ID" /></label><datalist id="route-reference-list">{routes.slice(0,5000).map((r)=><option key={r.id} value={r.referenceNo || r.prfNo || r.srfNo || r.poNumber || r.trackingId}>{r.documentType} · {r.currentHolder || ""}</option>)}</datalist><label className="form-label">PO Number<input className="field" value={draft.poNumber||""} onChange={e=>setDraft({...draft,poNumber:e.target.value})} /></label></div><div className="form-2"><label className="form-label">PRF No.<input className="field" value={draft.prfNo||""} onChange={e=>setDraft({...draft,prfNo:e.target.value})} /></label><label className="form-label">Document Title<input className="field" value={draft.documentTitle||""} onChange={e=>setDraft({...draft,documentTitle:e.target.value})} /></label></div><div className="form-2"><label className="form-label">From<input className="field" value={draft.from||""} onChange={e=>setDraft({...draft,from:e.target.value})} /></label><label className="form-label">To<input className="field" value={draft.to||""} onChange={e=>setDraft({...draft,to:e.target.value})} /></label></div><div className="form-2"><label className="form-label">Current Holder<input className="field" value={draft.currentHolder||""} onChange={e=>setDraft({...draft,currentHolder:e.target.value})} /></label><label className="form-label">Received By<input className="field" value={draft.receivedBy||""} onChange={e=>setDraft({...draft,receivedBy:e.target.value})} /></label></div><div className="form-2"><label className="form-label">Status<select className="field" value={draft.status||"For Routing"} onChange={e=>setDraft({...draft,status:e.target.value})}>{["Pending","For Routing","Received","In Process","Returned","Completed","Overdue","Cancelled"].map(x=><option key={x}>{x}</option>)}</select></label><label className="form-label">Department<input className="field" value={draft.department||""} onChange={e=>setDraft({...draft,department:e.target.value})} /></label></div><label className="form-label">Requester<input className="field" value={draft.requester||""} onChange={e=>setDraft({...draft,requester:e.target.value})} /></label><label className="form-label">Remarks<textarea className="field" value={draft.remarks||""} onChange={e=>setDraft({...draft,remarks:e.target.value})} /></label></div><div className="modal-actions"><button className="btn ghost" onClick={()=>setOpen(false)} type="button">Cancel</button><button className="btn primary" onClick={()=>void save()} type="button">Save Route</button></div></Modal>}
+      {open && <Modal title={draft.id ? "Edit Routing Record" : "Add Routing Record"} onClose={()=>setOpen(false)}><div className="form-grid"><div className="form-2"><label className="form-label">Tracking ID<input className="field" value={draft.trackingId||""} onChange={e=>setDraft({...draft,trackingId:e.target.value})} /></label><label className="form-label">Document Type<input className="field" value={draft.documentType||"PO"} onChange={e=>setDraft({...draft,documentType:e.target.value})} /></label></div><div className="form-2"><label className="form-label">Reference No.<input className="field" value={draft.referenceNo||""} onChange={e=>setDraft({...draft,referenceNo:e.target.value})} /></label><label className="form-label">PO Number<input className="field" value={draft.poNumber||""} onChange={e=>setDraft({...draft,poNumber:e.target.value})} /></label></div><div className="form-2"><label className="form-label">PRF No.<input className="field" value={draft.prfNo||""} onChange={e=>setDraft({...draft,prfNo:e.target.value})} /></label><label className="form-label">Document Title<input className="field" value={draft.documentTitle||""} onChange={e=>setDraft({...draft,documentTitle:e.target.value})} /></label></div><div className="form-2"><label className="form-label">From<input className="field" value={draft.from||""} onChange={e=>setDraft({...draft,from:e.target.value})} /></label><label className="form-label">To<input className="field" value={draft.to||""} onChange={e=>setDraft({...draft,to:e.target.value})} /></label></div><div className="form-2"><label className="form-label">Current Holder<input className="field" value={draft.currentHolder||""} onChange={e=>setDraft({...draft,currentHolder:e.target.value})} /></label><label className="form-label">Received By<input className="field" value={draft.receivedBy||""} onChange={e=>setDraft({...draft,receivedBy:e.target.value})} /></label></div><div className="form-2"><label className="form-label">Status<select className="field" value={draft.status||"For Routing"} onChange={e=>setDraft({...draft,status:e.target.value})}>{["Pending","For Routing","Received","In Process","Returned","Completed","Overdue","Cancelled"].map(x=><option key={x}>{x}</option>)}</select></label><label className="form-label">Department<input className="field" value={draft.department||""} onChange={e=>setDraft({...draft,department:e.target.value})} /></label></div><label className="form-label">Requester<input className="field" value={draft.requester||""} onChange={e=>setDraft({...draft,requester:e.target.value})} /></label><label className="form-label">Remarks<textarea className="field" value={draft.remarks||""} onChange={e=>setDraft({...draft,remarks:e.target.value})} /></label></div><div className="modal-actions"><button className="btn ghost" onClick={()=>setOpen(false)} type="button">Cancel</button><button className="btn primary" onClick={()=>void save()} type="button">Save Route</button></div></Modal>}
     </div>
   );
 }
@@ -2953,13 +2722,11 @@ function DeliveriesPage({
 function EvaluationsPage({
   evals,
   orders,
-  employees,
   onSave,
   onError
 }: {
   evals: SupplierEvaluation[];
   orders: PurchaseOrder[];
-  employees: Employee[];
   onSave: (item: any) => Promise<any>;
   onError: (message: string) => void;
 }) {
@@ -3015,10 +2782,10 @@ function EvaluationsPage({
 
       {open && <Modal title="Create Supplier Evaluation" onClose={()=>setOpen(false)}>
         <div className="form-grid">
-          <label className="form-label">PO Number <span style={{fontSize:11,color:"#0f766e"}}>↳ synced PO data</span><input className="field" list="evaluation-po-list" value={draft.poNumber||""} onChange={(e)=>{const order=orders.find((item)=>item.poNumber===e.target.value);setDraft({...draft,poNumber:e.target.value,vendorName:order?.vendorName||draft.vendorName,prfNo:order?.prfNo||draft.prfNo,totalAmount:order?.total||draft.totalAmount})}} /></label>
+          <label className="form-label">PO Number<input className="field" list="evaluation-po-list" value={draft.poNumber||""} onChange={(e)=>{const order=orders.find((item)=>item.poNumber===e.target.value);setDraft({...draft,poNumber:e.target.value,vendorName:order?.vendorName||draft.vendorName,prfNo:order?.prfNo||draft.prfNo,totalAmount:order?.total||draft.totalAmount})}} /></label>
           <datalist id="evaluation-po-list">{orders.map((order)=><option key={order.id} value={order.poNumber}/>)}</datalist>
           <div className="form-2"><label className="form-label">Supplier<input className="field" value={draft.vendorName||""} onChange={(e)=>setDraft({...draft,vendorName:e.target.value})}/></label><label className="form-label">PRF No.<input className="field" value={draft.prfNo||""} onChange={(e)=>setDraft({...draft,prfNo:e.target.value})}/></label></div>
-          <div className="form-2"><label className="form-label">Evaluator Name<input className="field" list="eval-employee-list" value={draft.evaluatorName||""} onChange={(e)=>{const name=e.target.value;const emp=employees.find((x)=>String(x.name||"").toLowerCase()===name.toLowerCase());setDraft({...draft,evaluatorName:name,evaluatorEmail:emp?.email||draft.evaluatorEmail||""})}}/></label><datalist id="eval-employee-list">{employees.slice(0,3000).map((e)=><option key={e.id} value={e.name}>{e.email||""}</option>)}</datalist><label className="form-label">Evaluator Email<input className="field" type="email" value={draft.evaluatorEmail||""} onChange={(e)=>setDraft({...draft,evaluatorEmail:e.target.value})}/></label></div>
+          <div className="form-2"><label className="form-label">Evaluator Name<input className="field" value={draft.evaluatorName||""} onChange={(e)=>setDraft({...draft,evaluatorName:e.target.value})}/></label><label className="form-label">Evaluator Email<input className="field" type="email" value={draft.evaluatorEmail||""} onChange={(e)=>setDraft({...draft,evaluatorEmail:e.target.value})}/></label></div>
           <div className="form-2"><label className="form-label">Role<select className="field" value={draft.evaluatorRole||"requisitioner"} onChange={(e)=>setDraft({...draft,evaluatorRole:e.target.value})}><option value="requisitioner">Requisitioner</option><option value="purchaser">Purchaser</option><option value="amd">AMD Personnel</option></select></label><label className="form-label">PO Total<input className="field" type="number" value={draft.totalAmount||0} onChange={(e)=>setDraft({...draft,totalAmount:Number(e.target.value)})}/></label></div>
           <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,fontWeight:700}}><input type="checkbox" checked={Boolean(draft.autoEmail)} onChange={(e)=>setDraft({...draft,autoEmail:e.target.checked})}/> Send evaluation email immediately after creation</label>
         </div>
@@ -3894,7 +3661,7 @@ function SyncPage({
         </div>
         <div className="card baseline-card">
           <div className="card-head"><div><b>2 · Import PRF / SRF Route history</b><span>Load the current V2 monitoring workbook and seed RouteTrack with the existing PRF/SRF routing timeline.</span></div><Route className="muted" /></div>
-          <div style={{padding:18}}><label className="upload-drop"><Route /><div><b>{importing === "routing" ? "Importing…" : "Choose V2 PRF / SRF Excel"}</b><span>Reads all PRF/SRF monitoring tabs in the V2 workbook and builds route history from the dated workflow stages</span></div><input hidden type="file" accept=".xlsx,.xls,.xlsm" disabled={!!importing} onChange={e=>void importBaseline("routing", e.target.files?.[0])}/></label></div>
+          <div style={{padding:18}}><label className="upload-drop"><Route /><div><b>{importing === "routing" ? "Importing…" : "Choose V2 PRF / SRF Excel"}</b><span>Uses PRF - SISC / SRF - SISC and builds route history from the dated stages</span></div><input hidden type="file" accept=".xlsx,.xls,.xlsm" disabled={!!importing} onChange={e=>void importBaseline("routing", e.target.files?.[0])}/></label></div>
         </div>
       </div>
 
@@ -3920,10 +3687,10 @@ function SyncPage({
 /* =========================================================
    ADMIN SHELL
 ========================================================= */
-type AdminSection = "dashboard" | "orders" | "suppliers" | "evaluations" | "routing" | "buyers" | "addresses" | "employees" | "users" | "notifications" | "analytics" | "sync" | "data" | "settings";
+type AdminSection = "dashboard" | "orders" | "suppliers" | "evaluations" | "routing" | "buyers" | "addresses" | "employees" | "users" | "notifications" | "analytics" | "sync" | "settings";
 
 function AdminShell({
-  profile, routes, evals, orders, requests, suppliers, onError, onSync, syncing, onOpenUserWorkspace, onLoadOlder
+  profile, routes, evals, orders, requests, suppliers, onError, onSync, syncing, onOpenUserWorkspace
 }: {
   profile: UserProfile;
   routes: RouteRecord[];
@@ -3935,7 +3702,6 @@ function AdminShell({
   onSync: ()=>void;
   syncing: boolean;
   onOpenUserWorkspace: (targetView?: View)=>void;
-  onLoadOlder: () => Promise<void>;
 }) {
   const [section, setSection] = useState<AdminSection>("dashboard");
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -3959,7 +3725,6 @@ function AdminShell({
     ]],
     ["SYSTEM", [
       ["sync","Spreadsheet Sync",<RefreshCw key="i"/>],
-      ["data","Spreadsheet Data Hub",<Database key="i"/>],
       ["settings","System Settings",<Settings key="i"/>],
     ]]
   ] as Array<[string, Array<[AdminSection,string,ReactNode]>]>;
@@ -3997,13 +3762,6 @@ function AdminShell({
           </div>
         </header>
         <section className="content">
-          <div className="data-window-banner">
-            <div>
-              <b>Quota-safe history window</b>
-              <span>Admin starts with recent records. Load older history only when you need deeper reporting or audit detail.</span>
-            </div>
-            <button className="btn ghost" type="button" onClick={() => void onLoadOlder()} disabled={syncing}>Load older admin data</button>
-          </div>
           <AdminOperations
             section={section}
             onSectionChange={(next)=>setSection(next)}
@@ -4020,110 +3778,6 @@ function AdminShell({
           />
         </section>
       </main>
-    </div>
-  );
-}
-
-/* =========================================================
-   SPREADSHEET DATA HUB
-========================================================= */
-function SpreadsheetDataHub({ onError }: { onError: (message: string) => void }) {
-  type SourceKey = "supplier" | "routing";
-  type TabInfo = { title: string; sheetId: number };
-  const [source, setSource] = useState<SourceKey>("supplier");
-  const [tabs, setTabs] = useState<TabInfo[]>([]);
-  const [tab, setTab] = useState("");
-  const [headers, setHeaders] = useState<string[]>([]);
-  const [rows, setRows] = useState<Record<string,string>[]>([]);
-  const [rowCount, setRowCount] = useState(0);
-  const [previewCount, setPreviewCount] = useState(0);
-  const [loadingTabs, setLoadingTabs] = useState(false);
-  const [loadingRows, setLoadingRows] = useState(false);
-  const [query, setQuery] = useState("");
-  const [message, setMessage] = useState("");
-
-  async function loadTabs(nextSource = source) {
-    setLoadingTabs(true); setMessage("");
-    try {
-      const response = await fetch(`/api/data-source?source=${nextSource}`, { cache: "no-store" });
-      const data = await response.json();
-      if (!response.ok || !data.ok) throw new Error(data.message || "Could not list spreadsheet tabs.");
-      setTabs(data.tabs || []);
-      const first = data.tabs?.[0]?.title || "";
-      setTab(first);
-      if (first) await loadTab(nextSource, first);
-    } catch (e: any) { setMessage(e?.message || "Could not load spreadsheet tabs."); onError(e?.message || "Could not load spreadsheet tabs."); }
-    finally { setLoadingTabs(false); }
-  }
-
-  async function loadTab(nextSource = source, nextTab = tab) {
-    if (!nextTab) return;
-    setLoadingRows(true); setMessage("");
-    try {
-      const response = await fetch(`/api/data-source?source=${nextSource}&tab=${encodeURIComponent(nextTab)}&limit=50`, { cache: "no-store" });
-      const data = await response.json();
-      if (!response.ok || !data.ok) throw new Error(data.message || "Could not read spreadsheet data.");
-      setHeaders(data.headers || []);
-      setRows(data.rows || []);
-      setRowCount(Number(data.rowCount || 0));
-      setPreviewCount(Number(data.previewCount || 0));
-    } catch (e: any) { setMessage(e?.message || "Could not read spreadsheet data."); onError(e?.message || "Could not read spreadsheet data."); }
-    finally { setLoadingRows(false); }
-  }
-
-  useEffect(() => { void loadTabs(source); }, [source]);
-
-  const filteredRows = rows.filter((row) => {
-    if (!query.trim()) return true;
-    const q = query.toLowerCase();
-    return Object.values(row).some(v => String(v ?? "").toLowerCase().includes(q));
-  });
-
-  return (
-    <div>
-      <PageHead
-        title="Spreadsheet Data Hub"
-        icon={<Database />}
-        action={<button className="btn ghost" type="button" onClick={() => void loadTab()} disabled={loadingRows}>{loadingRows ? "Reading…" : "Refresh data"}</button>}
-      />
-      <div className="info-strip" style={{marginBottom:16}}><Database /><div><b>See the source before importing it</b><span>This viewer reads the connected Google Sheet directly. It does not require loading the whole workbook into Firestore, so you can confirm that data exists without consuming your Firestore document quota.</span></div></div>
-      <div className="grid-2" style={{marginBottom:16}}>
-        <div className="card">
-          <div className="card-head"><div><b>Connected source</b><span>Choose the workbook you want to inspect.</span></div></div>
-          <div style={{padding:18}}>
-            <div className="segmented">
-              <button type="button" className={source === "supplier" ? "active" : ""} onClick={() => setSource("supplier")}>Supplier Evaluation</button>
-              <button type="button" className={source === "routing" ? "active" : ""} onClick={() => setSource("routing")}>V2 PRF / SRF</button>
-            </div>
-            <label className="form-label" style={{display:"grid",gap:6,marginTop:14}}>Sheet / Tab
-              <select className="field" value={tab} onChange={e => { setTab(e.target.value); void loadTab(source, e.target.value); }} disabled={loadingTabs || !tabs.length}>
-                {tabs.map(t => <option key={`${t.sheetId}-${t.title}`} value={t.title}>{t.title}</option>)}
-              </select>
-            </label>
-            <div className="stats" style={{gridTemplateColumns:"repeat(2,minmax(0,1fr))",marginTop:14}}>
-              <div className="stat"><div className="stat-label">Source rows</div><div className="stat-value">{rowCount.toLocaleString()}</div></div>
-              <div className="stat"><div className="stat-label">Preview loaded</div><div className="stat-value">{previewCount}</div></div>
-            </div>
-          </div>
-        </div>
-        <div className="card">
-          <div className="card-head"><div><b>Data availability</b><span>{tabs.length ? `${tabs.length} connected tabs detected.` : "Loading tabs…"}</span></div></div>
-          <div style={{padding:18,display:"grid",gap:10}}>
-            <div className="info-box"><div className="info-lbl">Current tab</div><b>{tab || "—"}</b></div>
-            <div className="info-box"><div className="info-lbl">Columns</div><b>{headers.length}</b></div>
-            <div className="info-box"><div className="info-lbl">Mode</div><b>Direct source preview</b></div>
-            <div className="info-box"><div className="info-lbl">Search</div><input className="field" placeholder="Search preview rows…" value={query} onChange={e=>setQuery(e.target.value)} /></div>
-          </div>
-        </div>
-      </div>
-      {message && <div className="info-strip warning" style={{marginBottom:16}}><AlertTriangle /><div><b>Data source message</b><span>{message}</span></div></div>}
-      <div className="card">
-        <div className="card-head"><div><b>{tab || "Spreadsheet preview"}</b><span>Showing {filteredRows.length} of {rowCount.toLocaleString()} source rows.</span></div><span className="sync-badge">Read-only preview</span></div>
-        <div className="table-wrap" style={{maxHeight:560,overflow:"auto"}}>
-          {headers.length ? <table><thead><tr>{headers.map(h=><th key={h}>{h}</th>)}</tr></thead><tbody>{filteredRows.map((row,i)=><tr key={i}>{headers.map(h=><td key={`${i}-${h}`}>{String(row[h] ?? "")}</td>)}</tr>)}</tbody></table> : <div className="empty"><Database className="muted" /><div className="empty-title">No preview loaded</div><div className="empty-sub">Choose a tab to inspect its source records.</div></div>}
-        </div>
-        {rowCount > previewCount && <div style={{padding:12,borderTop:"1px solid #e5e7eb",fontSize:12,color:"#64748b"}}>Only the first 50 rows are previewed to keep the page fast. Use the Sync Center to import changes; use this Data Hub to verify that the source itself contains the records you expect.</div>}
-      </div>
     </div>
   );
 }
@@ -4317,7 +3971,6 @@ function AdminOperations({
 
         {tab === "sync" && <><PageHead title="Admin Sync Center" icon={<RefreshCw />} action={<button className="btn primary" disabled={syncing} onClick={onSync} type="button"><RefreshCw className={syncing?"spin":""} /> {syncing?"Syncing…":"Full Reconciliation"}</button>} /><div className="grid-2"><div className="card"><div className="card-head"><div><b>Connected data sets</b><span>Full reconciliation, not append-only.</span></div></div><div style={{padding:18,display:"grid",gap:12}}><Metric label="Supplier Evaluations" value={evals.length}/><Metric label="Purchase Requests" value={requests.length}/><Metric label="Purchase Orders" value={orders.length}/><Metric label="Routes" value={routes.length}/></div></div><div className="card"><div className="card-head"><div><b>Sheets covered</b><span>All historical records are included.</span></div></div><div style={{padding:18,lineHeight:2}}><div>✓ PO for Evaluation</div><div>✓ PRF Details v2</div><div>✓ Route / monitoring sheet</div><div>✓ Firestore reconciliation</div></div></div></div><div className="card" style={{marginTop:16}}><div className="card-head"><div><b>Safe sync rules</b><span>Completed evaluations are never downgraded to pending.</span></div></div><div className="workflow"><Step n="01" t="Import" d="Read existing spreadsheet rows."/><Step n="02" t="Normalize" d="Map status, PO, PRF, evaluator and routing identifiers."/><Step n="03" t="Merge" d="Preserve completed/stronger Firestore records."/><Step n="04" t="Export" d="Update existing rows and append genuinely new records."/></div></div></>}
 
-        {tab === "data" && <SpreadsheetDataHub onError={onError} />}
         {tab === "settings" && <SettingsPage profile={profile} adminMode />}
 
         {emailTarget && <Modal title="Resend Supplier Evaluation" onClose={()=>setEmailTarget(null)}><div className="form-grid"><div style={{fontWeight:800}}>{emailTarget.vendorName} · PO {emailTarget.poNumber}</div><label className="form-label">Recipient Email<input className="field" type="email" value={email} onChange={e=>setEmail(e.target.value)} /></label><div className="info-strip"><Mail /><div><b>Submitted evaluations are protected</b><span>Resending will not overwrite a submitted response.</span></div></div></div><div className="modal-actions"><button className="btn ghost" onClick={()=>setEmailTarget(null)} type="button">Cancel</button><button className="btn primary" disabled={sending} onClick={()=>void resend(emailTarget)} type="button">{sending?"Sending…":"Send Evaluation Email"}</button></div></Modal>}
